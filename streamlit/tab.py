@@ -6,93 +6,62 @@ from pathlib import Path
 from typing import Optional
 
 def predicti(df_tomorrow_predictions,df_predictions,df_consultations):
-    import plotly.express as px
     st.set_page_config(page_title="상담 분석 대시보드", layout="wide")
-    st.header("상담 분석 (회귀/분류) — 예측일자 자동 감지")
-
-    # -----------------------------
-    # 0) 파일 경로 (내일 예측 파일 2개)
-    # -----------------------------
-             # (옵션) 전날 실제 Δ용
-    reg_pred = df_tomorrow_predictions
-    cls_pred = df_predictions
-
-    weekday_map = {0:"월",1:"화",2:"수",3:"목",4:"금",5:"토",6:"일"}
+    st.header("상담 분석 (회귀/분류) — 내일 예측")
 
     def _ensure_ts(df: Optional[pd.DataFrame], col="ts_slot"):
-        if df is None or col not in (df.columns if df is not None else []):
+        if df is None or col not in df.columns:
             return df
         if not np.issubdtype(df[col].dtype, np.datetime64):
             df[col] = pd.to_datetime(df[col], errors="coerce")
-        try:
-            if getattr(df[col].dt, "tz", None) is not None:
-                df[col] = df[col].dt.tz_convert(None)
-        except Exception:
-            pass
+        if getattr(df[col].dt, "tz", None) is not None:
+            df[col] = df[col].dt.tz_convert(None)
         return df
 
     # -----------------------------
     # 1) 데이터 로드
     # -----------------------------
-
     if df_consultations is None:
         cons_df = pd.DataFrame()
     elif isinstance(df_consultations, pd.DataFrame):
         cons_df = df_consultations.copy()
     else:
-        # list[dict] / dict 형태로 넘어와도 DF로 변환
         cons_df = pd.DataFrame(df_consultations)
 
-    # 날짜형 보정 (존재할 때만)
     for c in ["start_time", "end_time", "consultation_date", "ts_slot"]:
         if c in cons_df.columns:
             cons_df[c] = pd.to_datetime(cons_df[c], errors="coerce")
-            try:
-                if getattr(cons_df[c].dt, "tz", None) is not None:
-                    cons_df[c] = cons_df[c].dt.tz_convert(None)
-            except Exception:
-                pass
+            if getattr(cons_df[c].dt, "tz", None) is not None:
+                cons_df[c] = cons_df[c].dt.tz_convert(None)
 
-    # 예측 DF들(ts_slot만 보정)
-    reg_pred = _ensure_ts(reg_pred, "ts_slot")
-    cls_pred = _ensure_ts(cls_pred, "ts_slot")
-    
-    # 전날 실제 상담수 집계(옵션)
+    reg_pred = _ensure_ts(df_tomorrow_predictions, "ts_slot")
+    cls_pred = _ensure_ts(df_predictions, "ts_slot")
+
+    # 전날 실제 상담수 집계
     y_actual = None
-    if cons_df is not None and "start_time" in cons_df.columns:
+    if "start_time" in cons_df.columns:
         tmp = cons_df.copy()
         tmp["ts_slot"] = pd.to_datetime(tmp["start_time"], errors="coerce").dt.floor("h")
-        try:
-            if getattr(tmp["ts_slot"].dt, "tz", None) is not None:
-                tmp["ts_slot"] = tmp["ts_slot"].dt.tz_convert(None)
-        except Exception:
-            pass
+        if getattr(tmp["ts_slot"].dt, "tz", None) is not None:
+            tmp["ts_slot"] = tmp["ts_slot"].dt.tz_convert(None)
         y_actual = tmp.groupby("ts_slot").size().rename("y_actual").reset_index()
+
     # -----------------------------
-    # 2) 표시할 ‘예측일’ 자동 결정
+    # 2) 표시할 예측일 자동 결정
     # -----------------------------
     def infer_display_day(*dfs):
         slots = []
         for df in dfs:
             if df is not None and "ts_slot" in df.columns and not df.empty:
                 slots.append(pd.to_datetime(df["ts_slot"]).dt.normalize().min())
-        if not slots:
-            # 파일이 없거나 ts_slot이 없으면 오늘로
-            return pd.Timestamp.now().normalize()
-        return min(slots)  # 가장 이른 ts_slot의 날짜
+        return min(slots) if slots else pd.Timestamp.now().normalize()
 
     display_day = infer_display_day(reg_pred, cls_pred)
     day_start = display_day
-    day_end   = display_day + pd.Timedelta(days=1)
-
-    # 보조 라벨(있으면)
-    if reg_pred is not None and "weekday" in reg_pred.columns and "weekday_ko" not in reg_pred.columns:
-        reg_pred["weekday_ko"] = reg_pred["weekday"].map(weekday_map)
-    if cls_pred is not None and "weekday" in cls_pred.columns and "weekday_ko" not in cls_pred.columns:
-        cls_pred["weekday_ko"] = cls_pred["weekday"].map(weekday_map)
+    day_end = display_day + pd.Timedelta(days=1)
 
     # -----------------------------
-    # 3) 유틸: 전날 실제 합/평균
+    # 3) 전날 실제 합/평균
     # -----------------------------
     def prev_day_actual_sum_avg(day_df: pd.DataFrame, y_actual_df: Optional[pd.DataFrame]):
         if day_df is None or day_df.empty or y_actual_df is None or y_actual_df.empty:
@@ -107,20 +76,68 @@ def predicti(df_tomorrow_predictions,df_predictions,df_consultations):
     # -----------------------------
     # 4) 탭
     # -----------------------------
-    subtab_reg, subtab_cls = st.tabs(["📈 회귀: 예측일 예측", "🧭 분류: 예측일 Top-3"])
+    subtab_reg, subtab_cls = st.tabs(["📈 회귀: 다음 날 예측", "🧭 분류: 다음 날 자금유형 Top-3 예측"])
+
+    def _badge_by_score(value: float, higher_is_better: bool = True) -> str:
+        if value is None:
+            return "⚪ 보류"
+        v = value if higher_is_better else -value
+        if v >= 0.70:
+            return "🟢"
+        elif v >= 0.50:
+            return "🟡"
+        return "🔴"
+
+    def _reg_badge_rmse(rmse: float) -> str:
+        if rmse is None:
+            return "⚪"
+        if rmse <= 3.0:
+            return "🟢"
+        elif rmse <= 5.0:
+            return "🟡"
+        return "🔴"
+
+    def render_reg_summary_box():
+        st.markdown("#### 🧠 회귀 모델 요약")
+        st.caption("최종 Best: **ENS(0.75·XGB_Pois + 0.25·RF)**")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("RMSE (↓)", "3.668", None, help="실제 상담 건수와 예측 건수의 차이를 시간대별로 평균 제곱근 오차(Root Mean Squared Error)로 측정한 값")
+        c2.metric("신뢰 배지", _reg_badge_rmse(3.668), help="RMSE 기준 신뢰도: ≤3.0🟢 (매우 양호) / ≤5.0🟡 (보통) / 그 외🔴")
+        c3.caption(
+            "• 예측 기준: 과거 상담 로그의 시간대별 상담 건수  \n"
+            "• 목표1: **내일 각 시간대별 상담 수** 예측  \n"
+            "• 목표2: **내일 각 시간대별 자금유형별 건수** 예측  \n"
+            "• 앙상블 가중치: 0.75(XGB_Pois) + 0.25(RF)",
+            unsafe_allow_html=True
+        )
+
+    def render_cls_summary_box():
+        st.markdown("#### 🧠 분류 모델 요약")
+        auc_macro = 0.8443
+        acc = 0.6295
+        top3 = 0.9443
+        c1, c2, c3 = st.columns(3)
+        c1.metric("AUC (macro)", f"{auc_macro:.4f}", _badge_by_score(auc_macro), help="모든 자금유형 클래스 쌍에 대해 구한 ROC-AUC의 Macro 평균 (모델이 클래스 구분을 얼마나 잘하는지)")
+        c2.metric("ACC", f"{acc:.4f}", _badge_by_score(acc), help="전체 슬롯 중 올바르게 예측한 비율 (정확도)")
+        c3.metric("Top-3 Hit", f"{top3:.4f}", _badge_by_score(top3), help="예측 상위 3개 유형 안에 실제 상담 자금유형이 포함된 비율 (추천 성공률)")
+        st.caption(
+            "예측 기준: 과거 상담 로그의 시간대·요일·이전 유형 패턴  \n"
+            "목표: **내일 각 시간대별 상담의 주요 자금유형(Top-1~3)** 예측  \n"
+            "알고리즘: XGBClassifier"
+        )
 
     # =============================
-    # (A) 회귀: 예측일 예측
+    # (A) 회귀
     # =============================
     with subtab_reg:
-        st.subheader(f"예측일 예측 (회귀) — {day_start:%Y-%m-%d}")
+        st.subheader(f"내일 예측 (회귀) — {day_start:%Y-%m-%d}")
+        with st.expander('설명'):
+            render_reg_summary_box()
 
-        if reg_pred is None or "ts_slot" not in (reg_pred.columns if reg_pred is not None else []):
+        if reg_pred is None or "ts_slot" not in reg_pred.columns:
             st.info(f"{df_tomorrow_predictions.name} 파일이 없거나 ts_slot 컬럼이 없습니다.")
         else:
             df = reg_pred.copy()
-
-            # 예측 컬럼 후보 → 존재하는 첫 컬럼을 y_pred로 사용
             pred_candidates = ["y_pred", "y_pred_ENS", "y_pred_XGB_Pois", "y_pred_XGB_MSE", "y_pred_RF", "y_pred_HGB_P"]
             pred_col = next((c for c in pred_candidates if c in df.columns), None)
             if pred_col is None:
@@ -129,8 +146,12 @@ def predicti(df_tomorrow_predictions,df_predictions,df_consultations):
                 if "y_pred" not in df.columns:
                     df["y_pred"] = df[pred_col]
 
-                day_df = df[(df["ts_slot"] >= day_start) & (df["ts_slot"] < day_end)].copy().dropna(subset=["y_pred"])
-                day_df = day_df.sort_values("ts_slot")
+                day_df = (
+                    df[(df["ts_slot"] >= day_start) & (df["ts_slot"] < day_end)]
+                    .copy()
+                    .dropna(subset=["y_pred"])
+                    .sort_values("ts_slot")
+                )
 
                 if day_df.empty:
                     st.warning(f"{day_start:%Y-%m-%d} 날짜에 해당하는 예측 슬롯이 없습니다.")
@@ -141,9 +162,7 @@ def predicti(df_tomorrow_predictions,df_predictions,df_consultations):
                     delta_sum = total_pred - prev_sum
                     delta_avg = avg_hourly - prev_avg
 
-                    # 피크
-                    peak_idx = day_df["y_pred"].idxmax()
-                    peak_row = day_df.loc[peak_idx]
+                    peak_row = day_df.loc[day_df["y_pred"].idxmax()]
 
                     c1, c2, c3 = st.columns(3)
                     c1.metric("예측 합계", f"{total_pred:,} 건", f"{delta_sum:+.0f}")
@@ -156,7 +175,7 @@ def predicti(df_tomorrow_predictions,df_predictions,df_consultations):
                     fig_line.update_layout(xaxis_title="시간대", yaxis_title="예측 상담수")
                     st.plotly_chart(fig_line, use_container_width=True)
 
-                    st.markdown("### 🏆 피크 슬롯 Top-5")
+                    st.markdown("### 🏆 피크 시간대 Top-5")
                     top5 = day_df.sort_values("y_pred", ascending=False).head(5).copy()
                     top5["slot_dt"] = pd.to_datetime(top5["ts_slot"])
                     top5["slot_str"] = top5["slot_dt"].dt.strftime("%m-%d %H시")
@@ -171,17 +190,19 @@ def predicti(df_tomorrow_predictions,df_predictions,df_consultations):
                                 delta_text = f"{y_now - float(prev_act.iloc[0]):+0.0f}"
                         colz[i].metric(f"#{i+1} {r['slot_str']}", f"{y_now} 건", delta_text)
 
-                    st.markdown("### 📋 예측 표")
-                    show = day_df[["ts_slot","y_pred"]].copy().rename(columns={"ts_slot":"시간대","y_pred":"예측 상담수"})
+                    st.markdown("### 📋 시간대별 예측 상담 수")
+                    show = day_df[["ts_slot", "y_pred"]].copy().rename(columns={"ts_slot": "시간대", "y_pred": "예측 상담수"})
                     st.dataframe(show, use_container_width=True)
 
     # =============================
-    # (B) 분류: 예측일 Top-3
+    # (B) 분류
     # =============================
     with subtab_cls:
-        st.subheader(f"예측일 Top-3 (분류) — {day_start:%Y-%m-%d}")
+        st.subheader(f"내일 자금유형 예측 Top-3 (분류) — {day_start:%Y-%m-%d}")
+        with st.expander('설명'):
+            render_cls_summary_box()
 
-        if cls_pred is None or "ts_slot" not in (cls_pred.columns if cls_pred is not None else []):
+        if cls_pred is None or "ts_slot" not in cls_pred.columns:
             st.info(f"{df_predictions.name} 파일이 없거나 ts_slot 컬럼이 없습니다.")
         else:
             dc = cls_pred.copy()
@@ -190,78 +211,68 @@ def predicti(df_tomorrow_predictions,df_predictions,df_consultations):
             if day_dc.empty:
                 st.warning(f"{day_start:%Y-%m-%d} 날짜에 해당하는 Top-3 예측 슬롯이 없습니다.")
             else:
-                # cls_pred_tomorrow_xgb.csv 형식(top1~3, p1~3)에 맞춤
-                cols = [c for c in ["ts_slot","pred_label","top1","p1","top2","p2","top3","p3"] if c in day_dc.columns]
+                cols = [c for c in ["ts_slot", "pred_label", "top1", "p1", "top2", "p2", "top3", "p3"] if c in day_dc.columns]
                 if len(cols) < 2:
                     st.info("Top-3 예측 컬럼(top*, p*)이 없습니다.")
                 else:
                     tbl = day_dc[cols].rename(columns={
-                        "ts_slot":"시간대",
-                        "pred_label":"Top-1",
-                        "top1":"후보1","p1":"확률1",
-                        "top2":"후보2","p2":"확률2",
-                        "top3":"후보3","p3":"확률3",
+                        "ts_slot": "시간대",
+                        "pred_label": "Top-1",
+                        "top1": "후보1", "p1": "확률1",
+                        "top2": "후보2", "p2": "확률2",
+                        "top3": "후보3", "p3": "확률3",
                     })
-                    for p in ["확률1","확률2","확률3"]:
+                    for p in ["확률1", "확률2", "확률3"]:
                         if p in tbl.columns:
                             tbl[p] = tbl[p].astype(float).round(3)
                     st.dataframe(tbl, use_container_width=True)
 
-        import plotly.express as px
+            futc = day_dc.copy()
 
-        # futc = 미래/예측 구간 데이터프레임 (여기선 day_dc)
-        futc = day_dc.copy()
+            top1_col, p1_col = None, None
+            if "ens_top1" in futc.columns:
+                top1_col = "ens_top1"
+                p1_col = "ens_p1" if "ens_p1" in futc.columns else None
+            elif "top1" in futc.columns:
+                top1_col = "top1"
+                p1_col = "p1" if "p1" in futc.columns else None
+            elif "pred_label" in futc.columns:
+                top1_col = "pred_label"
 
-        # 컬럼 스키마 자동 감지
-        top1_col = None
-        p1_col = None
-        if "ens_top1" in futc.columns:         # 예: 과거 ENS 스키마
-            top1_col = "ens_top1"
-            p1_col   = "ens_p1" if "ens_p1" in futc.columns else None
-        elif "top1" in futc.columns:           # 예: xgb_tomorrow 스키마
-            top1_col = "top1"
-            p1_col   = "p1" if "p1" in futc.columns else None
-        elif "pred_label" in futc.columns:     # Top-1만 있는 경우
-            top1_col = "pred_label"
-
-        if top1_col is None:
-            st.info("Top-1 컬럼을 찾을 수 없어 추천 랭킹을 생략합니다.")
-        else:
-            # 가중 방식 선택: 개수 기반 vs 확률합(p1) 기반
-            how = st.radio(
-                "집계 기준 선택",
-                ["개수 기준(빈도)", "확률합 기준(모델 확신도)"],
-                horizontal=True, index=0, key="rank_mode"
-            )
-
-            if how.startswith("개수") or (p1_col is None):
-                dist = futc[top1_col].value_counts().reset_index()
-                dist.columns = ["fund_type","score"]   # score = count
-                metric_label = "건"
+            if top1_col is None:
+                st.info("Top-1 컬럼을 찾을 수 없어 추천 랭킹을 생략합니다.")
             else:
-                dist = futc.groupby(top1_col)[p1_col].sum().reset_index()
-                dist.columns = ["fund_type","score"]   # score = prob_sum
-                metric_label = "점(확률합)"
+                how = st.radio(
+                    "집계 기준 선택",
+                    ["개수 기준(빈도)", "확률합(p1) 기준(모델 확신도)"],
+                    horizontal=True, index=0, key="rank_mode"
+                )
 
-            # 상위 3개
-            top3 = dist.sort_values("score", ascending=False).head(3).reset_index(drop=True)
+                if how.startswith("개수") or (p1_col is None):
+                    dist = futc[top1_col].value_counts().reset_index()
+                    dist.columns = ["fund_type", "score"]
+                    metric_label = "건"
+                else:
+                    dist = futc.groupby(top1_col)[p1_col].sum().reset_index()
+                    dist.columns = ["fund_type", "score"]
+                    metric_label = "점(확률합)"
 
-            st.markdown("### 🏆 예측 추천 Top-3 (예측 구간 전체 기준)")
-            c1, c2, c3 = st.columns(3)
-            for i, row in top3.iterrows():
-                col = [c1, c2, c3][i]
-                col.metric(f"#{i+1} {row['fund_type']}", f"{row['score']:.3f}" if metric_label.startswith("점") else f"{int(row['score'])} {metric_label}")
+                top3 = dist.sort_values("score", ascending=False).head(3).reset_index(drop=True)
 
-            # 도넛(Top-3만)
-            fig_pie = px.pie(
-                top3, values="score", names="fund_type",
-                title="예측 구간 Top-3 비중",
-                color_discrete_sequence=px.colors.qualitative.Pastel,  # 파스텔
-                hole=0.55
-            )
-            fig_pie.update_traces(textinfo="label+percent", pull=[0.1, 0.05, 0])
-            st.plotly_chart(fig_pie, use_container_width=True)
+                st.markdown("### 🏆 예측 추천 Top-3")
+                c1, c2, c3 = st.columns(3)
+                for i, row in top3.iterrows():
+                    col = [c1, c2, c3][i]
+                    col.metric(f"#{i+1} {row['fund_type']}", f"{row['score']:.3f}" if metric_label.startswith("점") else f"{int(row['score'])} {metric_label}")
 
-            # (옵션) 전체 랭킹 표
-            with st.expander("전체 랭킹 보기"):
-                st.dataframe(dist.sort_values("score", ascending=False).reset_index(drop=True), use_container_width=True)
+                fig_pie = px.pie(
+                    top3, values="score", names="fund_type",
+                    title="예측 구간 Top-3 비중",
+                    color_discrete_sequence=px.colors.qualitative.Pastel,
+                    hole=0.55
+                )
+                fig_pie.update_traces(textinfo="label+percent", pull=[0.1, 0.05, 0])
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+                with st.expander("전체 랭킹 보기"):
+                    st.dataframe(dist.sort_values("score", ascending=False).reset_index(drop=True), use_container_width=True)
